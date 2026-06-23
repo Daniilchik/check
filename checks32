@@ -1,0 +1,2 @@
+HUE=$(kubectl -n dev-prizva get pod -l component=hue -o jsonpath='{.items[0].metadata.name}')
+kubectl -n dev-prizva logs $HUE -c hue -f | grep -iE 'DEBUG middleware|DEBUG get_credentials'
