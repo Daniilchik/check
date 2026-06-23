@@ -1,0 +1,3 @@
+kubectl -n dev-prizva exec $HUE -c hue -- /usr/bin/python -c "
+print(open('/usr/share/hue/desktop/libs/aws/src/aws/client.py').read())
+" | grep -nE 'cache|CACHE|lru_cache|_make_client|def get_client|conn_cache|CLIENT_CACHE'
