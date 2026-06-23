@@ -1,0 +1,129 @@
+--- a/ozone_s3_creds/patch.py	2026-06-23 17:21:34
++++ b/ozone_s3_creds/patch.py	2026-06-23 17:21:09
+@@ -19,9 +19,6 @@
+ 
+     def patched_get_credentials(self):
+         access, secret = middleware.get_session_keys()
+-        # DEBUG: видно зовётся ли вообще get_credentials (если НЕ зовётся на
+-        # падающем S3-запросе → клиент закэширован) и что в thread-local.
+-        log.info("ozone_s3_creds DEBUG get_credentials: thread_local_access=%s", access)
+         if access and secret:
+             return {
+                 "AccessKeyId": access,
+@@ -61,6 +58,35 @@
+     log.info("ozone_s3_creds: monkey-patched desktop.lib.fs.proxyfs.ProxyFS._has_access for s3")
+ 
+ 
++def _patch_per_user_s3_cache():
++    # Hue кэширует S3-клиент в fsmanager.CLIENT_CACHE. Ключ включает username
++    # ТОЛЬКО если fsmanager._is_per_user_fs_cached(fs) == True, что требует
++    # aws.conf.GET_USER_CREDENTIALS_FROM_SECMAN=True. У нас secman выключен →
++    # кэш ОБЩИЙ (один S3-клиент на всех юзеров), строится один раз и запекает
++    # credentials. Для per-session ключей это фатально: первый кто построил
++    # клиент (во время login, с пустым thread-local → fallback) фиксирует
++    # fallback для всех.
++    #
++    # Патчим _is_per_user_fs_cached → True для s3a: кэш становится per-user,
++    # и clear_cached_client(name, user) начинает работать (см. signals.py).
++    try:
++        from desktop.lib import fsmanager
++    except ImportError:
++        log.warning("fsmanager not importable, skipping per-user S3 cache patch")
++        return
++
++    original = fsmanager._is_per_user_fs_cached
++
++    def patched(fs):
++        if fs == "s3a":
++            return True
++        return original(fs)
++
++    fsmanager._is_per_user_fs_cached = patched
++    log.info("ozone_s3_creds: monkey-patched fsmanager._is_per_user_fs_cached for s3a")
++
++
+ def install():
+     _patch_credential_provider()
+     _patch_proxyfs_has_access()
++    _patch_per_user_s3_cache()
+--- a/ozone_s3_creds/signals.py	2026-06-23 17:21:27
++++ b/ozone_s3_creds/signals.py	2026-06-23 17:21:09
+@@ -15,6 +15,23 @@
+ SESSION_SECRET_KEY = "ozone_s3_secret_key"
+ 
+ 
++def _clear_s3_client_cache(username):
++    """
++    Сбросить кэшированный per-user S3-клиент юзера в Hue fsmanager.
++    Нужно, т.к. клиент кэшируется с запечёнными credentials — после смены
++    ключей (login/logout) старый клиент надо выкинуть, чтобы он пересобрался
++    с актуальными session-ключами. Работает только если кэш per-user
++    (см. patch._patch_per_user_s3_cache).
++    """
++    try:
++        from desktop.lib import fsmanager
++        if getattr(fsmanager, "CLIENT_CACHE", None):
++            fsmanager.clear_cached_client("default", username)
++    except Exception as e:
++        log.warning("ozone_s3_creds: clear S3 client cache failed for %s: %s",
++                    username, e)
++
++
+ @receiver(user_logged_in)
+ def provision_on_login(sender, request, user, **kwargs):
+     password = request.POST.get("password") if request else None
+@@ -31,6 +48,16 @@
+ 
+     request.session[SESSION_ACCESS_KEY] = result["access_key"]
+     request.session[SESSION_SECRET_KEY] = result["secret_key"]
++
++    # Set thread-local сразу: если S3-клиент строится дальше в этом же
++    # login-запросе, он возьмёт уже выданные ключи (middleware перечитывает
++    # session только в начале запроса, а тут она ещё была пустой).
++    from . import middleware
++    middleware._set(result["access_key"], result["secret_key"])
++
++    # Выкинуть старый кэшированный S3-клиент юзера → пересоберётся с новыми ключами.
++    _clear_s3_client_cache(user.username)
++
+     log.info("ozone S3 keys provisioned for user=%s, access=%s",
+              user.username, result["access_key"])
+ 
+@@ -42,6 +69,7 @@
+     username = getattr(user, "username", None)
+     if username:
+         broker.revoke(username)
++        _clear_s3_client_cache(username)
+         log.info("ozone S3 keys revoked for user=%s", username)
+     if request and hasattr(request, "session"):
+         request.session.pop(SESSION_ACCESS_KEY, None)
+--- a/ozone_s3_creds/middleware.py	2026-06-23 17:21:22
++++ b/ozone_s3_creds/middleware.py	2026-06-23 17:21:09
+@@ -1,11 +1,8 @@
+ # -*- coding: utf-8 -*-
+ from __future__ import absolute_import
+ 
+-import logging
+ import threading
+ 
+-log = logging.getLogger(__name__)
+-
+ _storage = threading.local()
+ 
+ 
+@@ -35,12 +32,9 @@
+ 
+     def __call__(self, request):
+         session = getattr(request, "session", None)
+-        access = session.get(self.SESSION_ACCESS_KEY) if session is not None else None
+-        secret = session.get(self.SESSION_SECRET_KEY) if session is not None else None
+-        _set(access, secret)
+-        # DEBUG: видно для каждого request'a — есть ли ключи в session.
+-        log.info("ozone_s3_creds DEBUG middleware: path=%s session_access=%s",
+-                 getattr(request, "path", "?"), access)
++        if session is not None:
++            _set(session.get(self.SESSION_ACCESS_KEY),
++                 session.get(self.SESSION_SECRET_KEY))
+         try:
+             return self.get_response(request)
+         finally:
