@@ -1,0 +1,9 @@
+# 1) кэш в client.py — что вокруг _make_client и кто его зовёт
+kubectl -n dev-prizva exec $HUE -c hue -- /usr/bin/python -c "
+print(open('/usr/share/hue/desktop/libs/aws/src/aws/client.py').read())
+" | grep -nE 'CACHE|cache|_make_client|def get_client|def get_s3|conn'
+
+# 2) fsmanager — основной кэш фс per-user
+kubectl -n dev-prizva exec $HUE -c hue -- /usr/bin/python -c "
+print(open('/usr/share/hue/desktop/core/src/desktop/lib/fsmanager.py').read())
+" | grep -nE 'CACHE|cache|def |clear'
