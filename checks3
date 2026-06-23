@@ -1,0 +1,14 @@
+HUE=$(kubectl -n dev-prizva get pod -l component=hue -o jsonpath='{.items[0].metadata.name}')
+
+# 3a. оба monkey-patch'а встали
+kubectl -n dev-prizva logs $HUE -c hue | grep ozone_s3_creds
+# ждём 2 строки: CredentialProviderConf + ProxyFS._has_access
+
+# 3b. SPN host деривится правильно
+kubectl -n dev-prizva exec $HUE -c hue -- env | grep OZONE_S3G_SPN_HOST
+# → s3g-ozone-dev-prizva.apps.a74we5tj.k8s.delta.sbrf.ru
+
+# 3c. krb5.conf на месте
+kubectl -n dev-prizva exec $HUE -c hue -- /usr/bin/python -c "print(open('/etc/krb5.conf').read()[:200])"
+
+kubectl -n dev-prizva logs $HUE -c hue -f | grep -iE 'broker|provision|ozone S3 keys'
